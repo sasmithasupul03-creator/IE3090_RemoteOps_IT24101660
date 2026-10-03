@@ -10,6 +10,7 @@
 
 #define AGENT_PORT 9410
 #define SID_TAG "SID:0661"
+#define AUTH_TOKEN "OPS-1660"
 #define LOG_FILE "remoteops_IT24101660.log"
 #define BUFFER_SIZE 4096
 
@@ -76,22 +77,55 @@ void *handle_client(void *arg) {
            client_ip, client_port, (unsigned long)pthread_self());
     log_event(client_ip, client_port, "CONNECT", "SESSION_OPENED");
 
+    int authenticated = 0;
     char cmd[BUFFER_SIZE];
     char response[BUFFER_SIZE];
 
     while (read_line(client_fd, cmd, sizeof(cmd)) > 0) {
         printf("[Agent %s:%d] Received: %s\n", client_ip, client_port, cmd);
 
+        /* 1. Always allow QUIT even before authentication */
         if (strcmp(cmd, "QUIT") == 0) {
             snprintf(response, sizeof(response), "OK BYE %s\n", SID_TAG);
             send(client_fd, response, strlen(response), 0);
             log_event(client_ip, client_port, "QUIT", "OK BYE");
             break;
-        } else {
-            snprintf(response, sizeof(response), "ERR 000 NOT_IMPLEMENTED_YET %s\n", SID_TAG);
-            send(client_fd, response, strlen(response), 0);
-            log_event(client_ip, client_port, cmd, "ERR 000 NOT_IMPLEMENTED_YET");
         }
+
+        /* 2. Handle AUTH <token> command */
+        if (strncmp(cmd, "AUTH", 4) == 0 && (cmd[4] == ' ' || cmd[4] == '\0')) {
+            const char *token = cmd + 4;
+            while (*token == ' ') token++;
+
+            if (*token == '\0') {
+                snprintf(response, sizeof(response), "ERR 400 MISSING_TOKEN %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, cmd, "ERR 400 MISSING_TOKEN");
+            } else if (strcmp(token, AUTH_TOKEN) == 0) {
+                authenticated = 1;
+                snprintf(response, sizeof(response), "OK AUTH %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, cmd, "OK AUTH");
+            } else {
+                snprintf(response, sizeof(response), "ERR 401 INVALID_TOKEN %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, cmd, "ERR 401 INVALID_TOKEN");
+            }
+            continue;
+        }
+
+        /* 3. Reject all other commands if session is not authenticated */
+        if (!authenticated) {
+            snprintf(response, sizeof(response), "ERR 403 UNAUTHORIZED_PLEASE_AUTH_FIRST %s\n", SID_TAG);
+            send(client_fd, response, strlen(response), 0);
+            log_event(client_ip, client_port, cmd, "ERR 403 UNAUTHORIZED");
+            continue;
+        }
+
+        /* 4. Placeholder for authenticated commands (to be added in next commits) */
+        snprintf(response, sizeof(response), "ERR 400 UNKNOWN_COMMAND %s\n", SID_TAG);
+        send(client_fd, response, strlen(response), 0);
+        log_event(client_ip, client_port, cmd, "ERR 400 UNKNOWN_COMMAND");
     }
 
     printf("[Agent] Controller %s:%d disconnected.\n", client_ip, client_port);
