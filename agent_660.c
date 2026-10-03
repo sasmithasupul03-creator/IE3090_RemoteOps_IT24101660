@@ -3,19 +3,44 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h>
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
 #define AGENT_PORT 9410
 #define SID_TAG "SID:0661"
+#define LOG_FILE "remoteops_IT24101660.log"
 #define BUFFER_SIZE 4096
+
+/* Mutex to ensure thread-safe logging across concurrent Controller sessions */
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Structure to pass client details to each worker thread */
 typedef struct {
     int sockfd;
     struct sockaddr_in addr;
 } client_session_t;
+
+/* Thread-safe logging function with timestamp, client IP:port, command, and outcome */
+void log_event(const char *client_ip, int client_port, const char *command, const char *outcome) {
+    pthread_mutex_lock(&log_mutex);
+
+    FILE *fp = fopen(LOG_FILE, "a");
+    if (fp != NULL) {
+        time_t now = time(NULL);
+        struct tm tm_info;
+        localtime_r(&now, &tm_info);
+        char time_buf[32];
+        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
+
+        fprintf(fp, "[%s] [%s:%d] CMD=\"%s\" OUTCOME=\"%s\" (%s)\n",
+                time_buf, client_ip, client_port, command, outcome, SID_TAG);
+        fclose(fp);
+    }
+
+    pthread_mutex_unlock(&log_mutex);
+}
 
 /* Helper function to read a single newline-terminated line from TCP socket */
 ssize_t read_line(int sockfd, char *buffer, size_t maxlen) {
@@ -49,6 +74,7 @@ void *handle_client(void *arg) {
 
     printf("[Agent] Controller connected from %s:%d (Thread ID: %lu)\n",
            client_ip, client_port, (unsigned long)pthread_self());
+    log_event(client_ip, client_port, "CONNECT", "SESSION_OPENED");
 
     char cmd[BUFFER_SIZE];
     char response[BUFFER_SIZE];
@@ -59,14 +85,17 @@ void *handle_client(void *arg) {
         if (strcmp(cmd, "QUIT") == 0) {
             snprintf(response, sizeof(response), "OK BYE %s\n", SID_TAG);
             send(client_fd, response, strlen(response), 0);
+            log_event(client_ip, client_port, "QUIT", "OK BYE");
             break;
         } else {
             snprintf(response, sizeof(response), "ERR 000 NOT_IMPLEMENTED_YET %s\n", SID_TAG);
             send(client_fd, response, strlen(response), 0);
+            log_event(client_ip, client_port, cmd, "ERR 000 NOT_IMPLEMENTED_YET");
         }
     }
 
     printf("[Agent] Controller %s:%d disconnected.\n", client_ip, client_port);
+    log_event(client_ip, client_port, "DISCONNECT", "SESSION_CLOSED");
     close(client_fd);
     return NULL;
 }
