@@ -2,12 +2,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
+#include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
 #define AGENT_PORT 9410
 #define SID_TAG "SID:0661"
 #define BUFFER_SIZE 4096
+
+/* Structure to pass client details to each worker thread */
+typedef struct {
+    int sockfd;
+    struct sockaddr_in addr;
+} client_session_t;
 
 /* Helper function to read a single newline-terminated line from TCP socket */
 ssize_t read_line(int sockfd, char *buffer, size_t maxlen) {
@@ -30,11 +38,47 @@ ssize_t read_line(int sockfd, char *buffer, size_t maxlen) {
     return (ssize_t)n;
 }
 
+/* Thread function to handle an individual Controller session */
+void *handle_client(void *arg) {
+    client_session_t *session = (client_session_t *)arg;
+    int client_fd = session->sockfd;
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(session->addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+    int client_port = ntohs(session->addr.sin_port);
+    free(session);
+
+    printf("[Agent] Controller connected from %s:%d (Thread ID: %lu)\n",
+           client_ip, client_port, (unsigned long)pthread_self());
+
+    char cmd[BUFFER_SIZE];
+    char response[BUFFER_SIZE];
+
+    while (read_line(client_fd, cmd, sizeof(cmd)) > 0) {
+        printf("[Agent %s:%d] Received: %s\n", client_ip, client_port, cmd);
+
+        if (strcmp(cmd, "QUIT") == 0) {
+            snprintf(response, sizeof(response), "OK BYE %s\n", SID_TAG);
+            send(client_fd, response, strlen(response), 0);
+            break;
+        } else {
+            snprintf(response, sizeof(response), "ERR 000 NOT_IMPLEMENTED_YET %s\n", SID_TAG);
+            send(client_fd, response, strlen(response), 0);
+        }
+    }
+
+    printf("[Agent] Controller %s:%d disconnected.\n", client_ip, client_port);
+    close(client_fd);
+    return NULL;
+}
+
 int main(void) {
-    int server_fd, client_fd;
+    int server_fd;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_len = sizeof(client_addr);
     int opt = 1;
+
+    /* Ignore SIGPIPE so abrupt client disconnects do not crash the Agent */
+    signal(SIGPIPE, SIG_IGN);
 
     /* 1. Create TCP socket */
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -64,37 +108,34 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
-    printf("[Agent IT24101660] Listening on TCP port %d (%s)...\n", AGENT_PORT, SID_TAG);
+    printf("[Agent IT24101660] Multi-threaded Server listening on TCP port %d (%s)...\n",
+           AGENT_PORT, SID_TAG);
 
-    /* 4. Basic accept loop for initial skeleton */
+    /* 4. Concurrent accept loop spawning a detached pthread per Controller */
     while (1) {
-        client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
             perror("accept failed");
             continue;
         }
 
-        printf("[Agent] Controller connected from %s:%d\n",
-               inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-
-        char cmd[BUFFER_SIZE];
-        char response[BUFFER_SIZE];
-
-        while (read_line(client_fd, cmd, sizeof(cmd)) > 0) {
-            printf("[Agent] Received: %s\n", cmd);
-
-            if (strcmp(cmd, "QUIT") == 0) {
-                snprintf(response, sizeof(response), "OK BYE %s\n", SID_TAG);
-                send(client_fd, response, strlen(response), 0);
-                break;
-            } else {
-                snprintf(response, sizeof(response), "ERR 000 NOT_IMPLEMENTED_YET %s\n", SID_TAG);
-                send(client_fd, response, strlen(response), 0);
-            }
+        client_session_t *session = malloc(sizeof(client_session_t));
+        if (!session) {
+            perror("malloc failed");
+            close(client_fd);
+            continue;
         }
+        session->sockfd = client_fd;
+        session->addr = client_addr;
 
-        printf("[Agent] Controller disconnected.\n");
-        close(client_fd);
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, handle_client, session) != 0) {
+            perror("pthread_create failed");
+            free(session);
+            close(client_fd);
+            continue;
+        }
+        pthread_detach(tid);
     }
 
     close(server_fd);
