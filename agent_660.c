@@ -4,6 +4,8 @@
 #include <unistd.h>
 #include <signal.h>
 #include <time.h>
+#include <ctype.h>
+#include <dirent.h>
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -70,7 +72,6 @@ int get_system_status(char *out_buf, size_t max_len) {
     double load1 = 0.0, load5 = 0.0, load15 = 0.0;
     long mem_total_kb = 0, mem_avail_kb = 0;
 
-    /* 1. Read /proc/uptime */
     FILE *fp = fopen("/proc/uptime", "r");
     if (!fp) return -1;
     if (fscanf(fp, "%lf", &uptime_sec) != 1) {
@@ -79,7 +80,6 @@ int get_system_status(char *out_buf, size_t max_len) {
     }
     fclose(fp);
 
-    /* 2. Read /proc/loadavg */
     fp = fopen("/proc/loadavg", "r");
     if (!fp) return -1;
     if (fscanf(fp, "%lf %lf %lf", &load1, &load5, &load15) != 3) {
@@ -88,7 +88,6 @@ int get_system_status(char *out_buf, size_t max_len) {
     }
     fclose(fp);
 
-    /* 3. Read /proc/meminfo */
     fp = fopen("/proc/meminfo", "r");
     if (!fp) return -1;
     char line[256];
@@ -104,6 +103,76 @@ int get_system_status(char *out_buf, size_t max_len) {
     snprintf(out_buf, max_len,
              "OK STATUS uptime=%.0fs load=%.2f,%.2f,%.2f mem_used_kb=%ld mem_total_kb=%ld mem_pct=%.1f%% %s\n",
              uptime_sec, load1, load5, load15, mem_used_kb, mem_total_kb, mem_pct, SID_TAG);
+    return 0;
+}
+
+/* Check if a directory name in /proc is purely numeric (a PID) */
+int is_pid_dir(const char *name) {
+    if (!name || *name == '\0') return 0;
+    while (*name) {
+        if (!isdigit((unsigned char)*name)) return 0;
+        name++;
+    }
+    return 1;
+}
+
+/* Read running processes from /proc/[pid]/stat up to max_count */
+int get_process_list(int max_count, char *out_buf, size_t max_len) {
+    DIR *dir = opendir("/proc");
+    if (!dir) return -1;
+
+    char list_buf[BUFFER_SIZE - 256];
+    list_buf[0] = '\0';
+    size_t used = 0;
+    int count = 0;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL && count < max_count) {
+        if (!is_pid_dir(entry->d_name)) continue;
+
+        char stat_path[512];
+        snprintf(stat_path, sizeof(stat_path), "/proc/%s/stat", entry->d_name);
+
+        FILE *fp = fopen(stat_path, "r");
+        if (!fp) continue;
+
+        char stat_line[512];
+        if (fgets(stat_line, sizeof(stat_line), fp) != NULL) {
+            int pid = 0;
+            char state = '?';
+            char comm[128] = "unknown";
+
+            /* Extract process name inside parentheses (comm) and state */
+            char *l_paren = strchr(stat_line, '(');
+            char *r_paren = strrchr(stat_line, ')');
+            if (l_paren && r_paren && r_paren > l_paren) {
+                sscanf(stat_line, "%d", &pid);
+                size_t name_len = (size_t)(r_paren - l_paren - 1);
+                if (name_len >= sizeof(comm)) name_len = sizeof(comm) - 1;
+                memcpy(comm, l_paren + 1, name_len);
+                comm[name_len] = '\0';
+
+                if (r_paren[1] == ' ' && r_paren[2] != '\0') {
+                    state = r_paren[2];
+                }
+
+                char item[192];
+                int n = snprintf(item, sizeof(item), "%s%d:%s(%c)",
+                                 (count > 0) ? "," : "", pid, comm, state);
+                if (n > 0 && used + (size_t)n < sizeof(list_buf) - 1) {
+                    memcpy(list_buf + used, item, (size_t)n);
+                    used += (size_t)n;
+                    list_buf[used] = '\0';
+                    count++;
+                }
+            }
+        }
+        fclose(fp);
+    }
+    closedir(dir);
+
+    snprintf(out_buf, max_len, "OK PROC count=%d list=%s %s\n",
+             count, (count > 0) ? list_buf : "none", SID_TAG);
     return 0;
 }
 
@@ -174,6 +243,33 @@ void *handle_client(void *arg) {
                 snprintf(response, sizeof(response), "ERR 500 STATUS_READ_FAILED %s\n", SID_TAG);
                 send(client_fd, response, strlen(response), 0);
                 log_event(client_ip, client_port, "STATUS", "ERR 500 STATUS_READ_FAILED");
+            }
+            continue;
+        }
+
+        /* 5. Handle PROC [count] command */
+        if (strncmp(cmd, "PROC", 4) == 0 && (cmd[4] == ' ' || cmd[4] == '\0')) {
+            int max_procs = 10; /* Default to 10 processes if no count is specified */
+            const char *arg_str = cmd + 4;
+            while (*arg_str == ' ') arg_str++;
+
+            if (*arg_str != '\0') {
+                max_procs = atoi(arg_str);
+                if (max_procs <= 0 || max_procs > 50) {
+                    snprintf(response, sizeof(response), "ERR 400 INVALID_PROC_COUNT_USE_1_TO_50 %s\n", SID_TAG);
+                    send(client_fd, response, strlen(response), 0);
+                    log_event(client_ip, client_port, cmd, "ERR 400 INVALID_PROC_COUNT");
+                    continue;
+                }
+            }
+
+            if (get_process_list(max_procs, response, sizeof(response)) == 0) {
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, cmd, "OK PROC");
+            } else {
+                snprintf(response, sizeof(response), "ERR 500 PROC_READ_FAILED %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, cmd, "ERR 500 PROC_READ_FAILED");
             }
             continue;
         }
