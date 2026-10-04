@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/utsname.h>
 
 #define AGENT_PORT 9410
 #define SID_TAG "SID:0661"
@@ -176,6 +177,40 @@ int get_process_list(int max_count, char *out_buf, size_t max_len) {
     return 0;
 }
 
+/* Read hostname, kernel release, architecture, and OS details */
+int get_system_info(char *out_buf, size_t max_len) {
+    struct utsname uts;
+    if (uname(&uts) != 0) return -1;
+
+    char os_name[128] = "Linux";
+    FILE *fp = fopen("/etc/os-release", "r");
+    if (fp) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) {
+            if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
+                char *val = line + 12;
+                if (*val == '"') val++;
+                size_t len = strlen(val);
+                while (len > 0 && (val[len - 1] == '\n' || val[len - 1] == '\r' || val[len - 1] == '"')) {
+                    val[--len] = '\0';
+                }
+                snprintf(os_name, sizeof(os_name), "%s", val);
+                break;
+            }
+        }
+        fclose(fp);
+    }
+
+    /* Replace spaces in os_name with underscores for clean single-line framing */
+    for (char *p = os_name; *p; p++) {
+        if (*p == ' ') *p = '_';
+    }
+
+    snprintf(out_buf, max_len, "OK INFO host=%s kernel=%s arch=%s os=%s %s\n",
+             uts.nodename, uts.release, uts.machine, os_name, SID_TAG);
+    return 0;
+}
+
 /* Thread function to handle an individual Controller session */
 void *handle_client(void *arg) {
     client_session_t *session = (client_session_t *)arg;
@@ -270,6 +305,19 @@ void *handle_client(void *arg) {
                 snprintf(response, sizeof(response), "ERR 500 PROC_READ_FAILED %s\n", SID_TAG);
                 send(client_fd, response, strlen(response), 0);
                 log_event(client_ip, client_port, cmd, "ERR 500 PROC_READ_FAILED");
+            }
+            continue;
+        }
+
+        /* 6. Handle INFO command */
+        if (strcmp(cmd, "INFO") == 0) {
+            if (get_system_info(response, sizeof(response)) == 0) {
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, "INFO", "OK INFO");
+            } else {
+                snprintf(response, sizeof(response), "ERR 500 INFO_READ_FAILED %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, "INFO", "ERR 500 INFO_READ_FAILED");
             }
             continue;
         }
