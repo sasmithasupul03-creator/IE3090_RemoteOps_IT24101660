@@ -64,6 +64,49 @@ ssize_t read_line(int sockfd, char *buffer, size_t maxlen) {
     return (ssize_t)n;
 }
 
+/* Read real-time CPU load, memory usage, and uptime from /proc */
+int get_system_status(char *out_buf, size_t max_len) {
+    double uptime_sec = 0.0;
+    double load1 = 0.0, load5 = 0.0, load15 = 0.0;
+    long mem_total_kb = 0, mem_avail_kb = 0;
+
+    /* 1. Read /proc/uptime */
+    FILE *fp = fopen("/proc/uptime", "r");
+    if (!fp) return -1;
+    if (fscanf(fp, "%lf", &uptime_sec) != 1) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+
+    /* 2. Read /proc/loadavg */
+    fp = fopen("/proc/loadavg", "r");
+    if (!fp) return -1;
+    if (fscanf(fp, "%lf %lf %lf", &load1, &load5, &load15) != 3) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+
+    /* 3. Read /proc/meminfo */
+    fp = fopen("/proc/meminfo", "r");
+    if (!fp) return -1;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "MemTotal: %ld kB", &mem_total_kb) == 1) continue;
+        if (sscanf(line, "MemAvailable: %ld kB", &mem_avail_kb) == 1) continue;
+    }
+    fclose(fp);
+
+    long mem_used_kb = mem_total_kb - mem_avail_kb;
+    double mem_pct = (mem_total_kb > 0) ? ((double)mem_used_kb * 100.0 / mem_total_kb) : 0.0;
+
+    snprintf(out_buf, max_len,
+             "OK STATUS uptime=%.0fs load=%.2f,%.2f,%.2f mem_used_kb=%ld mem_total_kb=%ld mem_pct=%.1f%% %s\n",
+             uptime_sec, load1, load5, load15, mem_used_kb, mem_total_kb, mem_pct, SID_TAG);
+    return 0;
+}
+
 /* Thread function to handle an individual Controller session */
 void *handle_client(void *arg) {
     client_session_t *session = (client_session_t *)arg;
@@ -122,7 +165,20 @@ void *handle_client(void *arg) {
             continue;
         }
 
-        /* 4. Placeholder for authenticated commands (to be added in next commits) */
+        /* 4. Handle STATUS command */
+        if (strcmp(cmd, "STATUS") == 0) {
+            if (get_system_status(response, sizeof(response)) == 0) {
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, "STATUS", "OK STATUS");
+            } else {
+                snprintf(response, sizeof(response), "ERR 500 STATUS_READ_FAILED %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, "STATUS", "ERR 500 STATUS_READ_FAILED");
+            }
+            continue;
+        }
+
+        /* Placeholder for remaining authenticated commands */
         snprintf(response, sizeof(response), "ERR 400 UNKNOWN_COMMAND %s\n", SID_TAG);
         send(client_fd, response, strlen(response), 0);
         log_event(client_ip, client_port, cmd, "ERR 400 UNKNOWN_COMMAND");
@@ -140,10 +196,8 @@ int main(void) {
     socklen_t client_len = sizeof(client_addr);
     int opt = 1;
 
-    /* Ignore SIGPIPE so abrupt client disconnects do not crash the Agent */
     signal(SIGPIPE, SIG_IGN);
 
-    /* 1. Create TCP socket */
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket failed");
@@ -152,7 +206,6 @@ int main(void) {
 
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    /* 2. Bind socket to personalised port 9410 */
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
@@ -164,7 +217,6 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
-    /* 3. Listen for incoming Controller connections */
     if (listen(server_fd, 10) < 0) {
         perror("listen failed");
         close(server_fd);
@@ -174,7 +226,6 @@ int main(void) {
     printf("[Agent IT24101660] Multi-threaded Server listening on TCP port %d (%s)...\n",
            AGENT_PORT, SID_TAG);
 
-    /* 4. Concurrent accept loop spawning a detached pthread per Controller */
     while (1) {
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
