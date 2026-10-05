@@ -10,11 +10,14 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/utsname.h>
+#include <sys/stat.h>
 
 #define AGENT_PORT 9410
 #define SID_TAG "SID:0661"
 #define AUTH_TOKEN "OPS-1660"
 #define LOG_FILE "remoteops_IT24101660.log"
+#define UPLOAD_DIR "agentfiles/IT24101660"
+#define MAX_UPLOAD_BYTES (660 * 1024) /* 660 KB = 675,840 bytes */
 #define BUFFER_SIZE 4096
 
 /* Mutex to ensure thread-safe logging across concurrent Controller sessions */
@@ -263,6 +266,26 @@ int execute_whitelisted_cmd(const char *subcmd, char *out_buf, size_t max_len) {
     return 0;
 }
 
+/* Prevent directory traversal (rejects '/', '\', '..', or illegal chars) */
+int is_safe_filename(const char *fname) {
+    if (!fname || *fname == '\0' || *fname == '.') return 0;
+    if (strstr(fname, "..") != NULL) return 0;
+    if (strchr(fname, '/') != NULL || strchr(fname, '\\') != NULL) return 0;
+
+    for (const char *p = fname; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '.' && *p != '_' && *p != '-') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Ensure agentfiles/IT24101660 directory exists */
+void ensure_upload_dir(void) {
+    mkdir("agentfiles", 0755);
+    mkdir(UPLOAD_DIR, 0755);
+}
+
 /* Thread function to handle an individual Controller session */
 void *handle_client(void *arg) {
     client_session_t *session = (client_session_t *)arg;
@@ -404,7 +427,78 @@ void *handle_client(void *arg) {
             continue;
         }
 
-        /* Placeholder for remaining authenticated commands */
+        /* 8. Handle PUT <filename> <size> command */
+        if (strncmp(cmd, "PUT", 3) == 0 && (cmd[3] == ' ' || cmd[3] == '\0')) {
+            char fname[256] = {0};
+            long fsize = -1;
+
+            if (sscanf(cmd + 3, "%255s %ld", fname, &fsize) != 2) {
+                snprintf(response, sizeof(response), "ERR 400 USAGE_PUT_FILENAME_SIZE %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, cmd, "ERR 400 USAGE_PUT_FILENAME_SIZE");
+                continue;
+            }
+
+            if (!is_safe_filename(fname)) {
+                snprintf(response, sizeof(response), "ERR 403 INVALID_FILENAME_PATH_TRAVERSAL_BLOCKED %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, cmd, "ERR 403 PATH_TRAVERSAL_BLOCKED");
+                continue;
+            }
+
+            if (fsize < 0 || fsize > MAX_UPLOAD_BYTES) {
+                snprintf(response, sizeof(response), "ERR 413 FILE_TOO_LARGE_MAX_660KB(%d_BYTES) %s\n",
+                         MAX_UPLOAD_BYTES, SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, cmd, "ERR 413 FILE_TOO_LARGE_MAX_660KB");
+                continue;
+            }
+
+            ensure_upload_dir();
+            char dest_path[512];
+            snprintf(dest_path, sizeof(dest_path), "%s/%s", UPLOAD_DIR, fname);
+
+            FILE *out_fp = fopen(dest_path, "wb");
+            if (!out_fp) {
+                snprintf(response, sizeof(response), "ERR 500 CANNOT_CREATE_FILE %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, cmd, "ERR 500 CANNOT_CREATE_FILE");
+                continue;
+            }
+
+            /* Send READY handshake to tell Controller to stream raw file bytes */
+            snprintf(response, sizeof(response), "READY %s\n", SID_TAG);
+            send(client_fd, response, strlen(response), 0);
+
+            long remaining = fsize;
+            char file_buf[BUFFER_SIZE];
+            int transfer_ok = 1;
+
+            while (remaining > 0) {
+                size_t to_read = (remaining < (long)sizeof(file_buf)) ? (size_t)remaining : sizeof(file_buf);
+                ssize_t got = recv(client_fd, file_buf, to_read, 0);
+                if (got <= 0) {
+                    transfer_ok = 0;
+                    break;
+                }
+                fwrite(file_buf, 1, (size_t)got, out_fp);
+                remaining -= got;
+            }
+            fclose(out_fp);
+
+            if (transfer_ok) {
+                snprintf(response, sizeof(response), "OK PUT saved=%s bytes=%ld %s\n",
+                         dest_path, fsize, SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, cmd, "OK PUT");
+            } else {
+                log_event(client_ip, client_port, cmd, "ERR 500 UPLOAD_INTERRUPTED");
+                break;
+            }
+            continue;
+        }
+
+        /* Unknown command */
         snprintf(response, sizeof(response), "ERR 400 UNKNOWN_COMMAND %s\n", SID_TAG);
         send(client_fd, response, strlen(response), 0);
         log_event(client_ip, client_port, cmd, "ERR 400 UNKNOWN_COMMAND");
@@ -423,6 +517,7 @@ int main(void) {
     int opt = 1;
 
     signal(SIGPIPE, SIG_IGN);
+    ensure_upload_dir();
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
