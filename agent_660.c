@@ -201,13 +201,65 @@ int get_system_info(char *out_buf, size_t max_len) {
         fclose(fp);
     }
 
-    /* Replace spaces in os_name with underscores for clean single-line framing */
     for (char *p = os_name; *p; p++) {
         if (*p == ' ') *p = '_';
     }
 
     snprintf(out_buf, max_len, "OK INFO host=%s kernel=%s arch=%s os=%s %s\n",
              uts.nodename, uts.release, uts.machine, os_name, SID_TAG);
+    return 0;
+}
+
+/* Validate against strict whitelist and execute safe system command */
+int execute_whitelisted_cmd(const char *subcmd, char *out_buf, size_t max_len) {
+    const char *whitelist[] = {
+        "date",
+        "whoami",
+        "uname -a",
+        "df -h",
+        "uptime",
+        NULL
+    };
+
+    int allowed = 0;
+    for (int i = 0; whitelist[i] != NULL; i++) {
+        if (strcmp(subcmd, whitelist[i]) == 0) {
+            allowed = 1;
+            break;
+        }
+    }
+
+    if (!allowed) {
+        return -2; /* Not whitelisted */
+    }
+
+    FILE *pipe = popen(subcmd, "r");
+    if (!pipe) return -1;
+
+    char raw_out[BUFFER_SIZE - 256];
+    size_t total = 0;
+    char line[256];
+
+    raw_out[0] = '\0';
+    while (fgets(line, sizeof(line), pipe) != NULL) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) continue;
+
+        int n = snprintf(raw_out + total, sizeof(raw_out) - total, "%s%s",
+                         (total > 0) ? " | " : "", line);
+        if (n < 0 || (size_t)n >= sizeof(raw_out) - total) {
+            total = sizeof(raw_out) - 1;
+            break;
+        }
+        total += (size_t)n;
+    }
+    pclose(pipe);
+
+    snprintf(out_buf, max_len, "OK EXEC cmd=\"%s\" output=\"%s\" %s\n",
+             subcmd, (total > 0) ? raw_out : "(empty)", SID_TAG);
     return 0;
 }
 
@@ -284,7 +336,7 @@ void *handle_client(void *arg) {
 
         /* 5. Handle PROC [count] command */
         if (strncmp(cmd, "PROC", 4) == 0 && (cmd[4] == ' ' || cmd[4] == '\0')) {
-            int max_procs = 10; /* Default to 10 processes if no count is specified */
+            int max_procs = 10;
             const char *arg_str = cmd + 4;
             while (*arg_str == ' ') arg_str++;
 
@@ -318,6 +370,36 @@ void *handle_client(void *arg) {
                 snprintf(response, sizeof(response), "ERR 500 INFO_READ_FAILED %s\n", SID_TAG);
                 send(client_fd, response, strlen(response), 0);
                 log_event(client_ip, client_port, "INFO", "ERR 500 INFO_READ_FAILED");
+            }
+            continue;
+        }
+
+        /* 7. Handle EXEC <cmd> command */
+        if (strncmp(cmd, "EXEC", 4) == 0 && (cmd[4] == ' ' || cmd[4] == '\0')) {
+            const char *subcmd = cmd + 4;
+            while (*subcmd == ' ') subcmd++;
+
+            if (*subcmd == '\0') {
+                snprintf(response, sizeof(response), "ERR 400 MISSING_EXEC_COMMAND %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, cmd, "ERR 400 MISSING_EXEC_COMMAND");
+                continue;
+            }
+
+            int rc = execute_whitelisted_cmd(subcmd, response, sizeof(response));
+            if (rc == 0) {
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, cmd, "OK EXEC");
+            } else if (rc == -2) {
+                snprintf(response, sizeof(response),
+                         "ERR 403 COMMAND_NOT_WHITELISTED_ALLOWED(date,whoami,uname -a,df -h,uptime) %s\n",
+                         SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, cmd, "ERR 403 COMMAND_NOT_WHITELISTED");
+            } else {
+                snprintf(response, sizeof(response), "ERR 500 EXEC_FAILED %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event(client_ip, client_port, cmd, "ERR 500 EXEC_FAILED");
             }
             continue;
         }
